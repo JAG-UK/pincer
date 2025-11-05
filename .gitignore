@@ -1,0 +1,41 @@
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Application
+image_mapping.json
+*.log
+
+# Storage (blobs and manifests)
+storage/
+
+# Testing
+coverage/
+.nyc_output/
+
+# Python (legacy - can be removed after migration)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+venv/
+env/
+ENV/
+.venv
+.pytest_cache/
