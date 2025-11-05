@@ -30,9 +30,12 @@ export class ImageMapping {
 
   private saveMappings(): void {
     try {
-      writeFileSync(this.mappingFile, JSON.stringify(this.mappings, null, 2));
+      const jsonContent = JSON.stringify(this.mappings, null, 2);
+      console.log(`[MAPPING] Saving mappings to ${this.mappingFile} (${jsonContent.length} bytes)`);
+      writeFileSync(this.mappingFile, jsonContent);
+      console.log(`[MAPPING] Mappings saved successfully`);
     } catch (error) {
-      console.error(`Failed to save mappings: ${error}`);
+      console.error(`[MAPPING] Failed to save mappings: ${error}`);
     }
   }
 
@@ -115,6 +118,7 @@ export class ImageMapping {
     blobs?: Record<string, string>
   ): void {
     const imageKey = `${imageName}:${reference}`;
+    console.log(`[MAPPING] Adding mapping: ${imageKey} -> ${manifestCid} (blobs: ${blobs ? Object.keys(blobs).length : 0})`);
 
     if (blobs && Object.keys(blobs).length > 0) {
       this.mappings[imageKey] = {
@@ -125,8 +129,9 @@ export class ImageMapping {
       this.mappings[imageKey] = manifestCid;
     }
 
+    console.log(`[MAPPING] Current mappings keys: ${Object.keys(this.mappings).join(', ')}`);
     this.saveMappings();
-    console.log(`Added mapping: ${imageKey} -> ${manifestCid}`);
+    console.log(`[MAPPING] Added mapping: ${imageKey} -> ${manifestCid}`);
   }
 
   // Update mappings (for external updates)

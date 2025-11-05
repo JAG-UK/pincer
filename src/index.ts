@@ -1,9 +1,15 @@
 import express, { Request, Response } from 'express';
 import { createHash } from 'crypto';
+import pino from 'pino';
 import { loadConfig, Config } from './config.js';
 import { ImageMapping } from './mapping.js';
 import { BlobStorage } from './storage.js';
 import { parseManifestLayers } from './utils.js';
+import { requireAuth, optionalAuth, type AuthCredentials } from './auth.js';
+import { getSynapseService, cleanupAllServices } from './synapse-manager.js';
+import { createCarFromBytes } from './car-utils.js';
+import { executeUpload, getDownloadURL } from 'filecoin-pin/core/upload';
+import { CID } from 'multiformats/cid';
 
 const app = express();
 
@@ -14,6 +20,7 @@ app.set('strict routing', false);
 let config: Config;
 let imageMapping: ImageMapping;
 let blobStorage: BlobStorage;
+let logger: pino.Logger;
 
 // Initialize on startup
 function initialize() {
@@ -21,20 +28,65 @@ function initialize() {
   imageMapping = new ImageMapping(config.mappingFile);
   blobStorage = new BlobStorage(config.storageDir);
   
-  console.log('PinCeR started');
-  console.log(`Blob storage directory: ${config.storageDir}`);
+  // Initialize logger
+  logger = pino({
+    level: process.env.LOG_LEVEL || 'info', // Back to info level by default
+  });
+  
+  logger.info({ event: 'pincer.start' }, 'PinCeR started');
+  logger.info({ storageDir: config.storageDir }, 'Blob storage initialized');
 }
 
 // Middleware
 app.use(express.raw({ type: '*/*', limit: '10gb' }));
 
+// Request logging middleware (for debugging auth issues)
+app.use((req: Request, res: Response, next: () => void) => {
+  if (req.path.startsWith('/v2/')) {
+    const authHeader = req.headers.authorization;
+    logger.debug({
+      event: 'request',
+      method: req.method,
+      path: req.path,
+      hasAuth: !!authHeader,
+      authType: authHeader ? (authHeader.startsWith('Basic ') ? 'Basic' : authHeader.startsWith('Bearer ') ? 'Bearer' : 'Unknown') : 'none',
+    }, 'Incoming request');
+  }
+  next();
+});
+
 // OCI Distribution Spec endpoints
 
-app.get('/v2/', (req: Request, res: Response) => {
+app.get('/v2/', optionalAuth, (req: Request, res: Response) => {
+  // Docker checks this endpoint to see if auth is required
+  // For insecure HTTP registries, Docker often doesn't send credentials automatically
+  // unless it's challenged with a 401 first. We return 401 if no auth is provided
+  // to force Docker to authenticate, then it will send credentials on subsequent requests
+  
+  if (!req.headers.authorization) {
+    // Return 401 to challenge Docker - this forces Docker to use stored credentials
+    res.set('WWW-Authenticate', 'Basic realm="PinCeR Registry"');
+    res.status(401).json({
+      errors: [{
+        code: 'UNAUTHORIZED',
+        message: 'Authentication required',
+        detail: 'Provide credentials via Authorization header (Basic Auth or Bearer token)'
+      }]
+    });
+    return;
+  }
+  
+  // If auth is provided, return success
   res.json({ version: '2.0' });
 });
 
-app.head('/v2/', (req: Request, res: Response) => {
+app.head('/v2/', optionalAuth, (req: Request, res: Response) => {
+  // Same logic for HEAD requests
+  if (!req.headers.authorization) {
+    res.set('WWW-Authenticate', 'Basic realm="PinCeR Registry"');
+    res.status(401).send();
+    return;
+  }
   res.sendStatus(200);
 });
 
@@ -50,57 +102,96 @@ app.get('/v2/*/manifests/:reference', async (req: Request, res: Response) => {
     return res.status(404).json({ error: `Manifest not found for ${name}:${reference}` });
   }
   
-  // TODO: Fetch manifest from Filecoin Pin using CID if cid doesn't start with 'sha256:'
-  // For now, check local storage first
-  // The mapping stores the digest directly for local storage
-  // If the CID is a digest (starts with 'sha256:'), use it directly
-  // Otherwise, it's a Filecoin Pin CID and we should fetch from there
-  const manifestDigest = cid.startsWith('sha256:') ? cid : null;
-  
-  if (!manifestDigest) {
-    // TODO: Fetch from Filecoin Pin using CID
-    return res.status(404).json({ error: `Manifest not found - Filecoin Pin integration needed (CID: ${cid})` });
+  // Check if CID is a digest (local storage) or IPFS CID (Filecoin Pin)
+  if (cid.startsWith('sha256:')) {
+    // Local storage - lookup by digest
+    const manifestPath = blobStorage.getManifestPath(cid);
+    
+    if (!manifestPath) {
+      return res.status(404).json({ error: `Manifest not found locally (digest: ${cid})` });
+    }
+    
+    // Read manifest from local storage
+    const manifestBytes = await import('fs').then(fs => fs.promises.readFile(manifestPath));
+    
+    // Parse manifest to determine content type
+    let manifestData: any;
+    try {
+      manifestData = JSON.parse(manifestBytes.toString('utf-8'));
+    } catch (error) {
+      return res.status(500).json({ error: 'Failed to parse manifest' });
+    }
+    
+    // Determine content type based on manifest schema
+    let contentType = 'application/vnd.docker.distribution.manifest.v2+json';
+    if (manifestData.mediaType) {
+      contentType = manifestData.mediaType;
+    } else if (manifestData.schemaVersion === 2) {
+      contentType = 'application/vnd.docker.distribution.manifest.v2+json';
+    } else {
+      contentType = 'application/vnd.oci.image.manifest.v1+json';
+    }
+    
+    // Return manifest with proper headers
+    res.set({
+      'Content-Type': contentType,
+      'Docker-Content-Digest': cid,
+      'Content-Length': manifestBytes.length.toString(),
+    });
+    res.send(manifestBytes);
+    return;
   }
   
-  const manifestPath = blobStorage.getManifestPath(manifestDigest);
-  
-  if (!manifestPath) {
-    // TODO: Fetch from Filecoin Pin if not found locally
-    return res.status(404).json({ error: `Manifest not found locally (digest: ${manifestDigest})` });
-  }
-  
-  // Read manifest from local storage
-  const manifestBytes = await import('fs').then(fs => fs.promises.readFile(manifestPath));
-  
-  // Parse manifest to determine content type
-  let manifestData: any;
+  // IPFS CID - fetch from Filecoin Pin
   try {
-    manifestData = JSON.parse(manifestBytes.toString('utf-8'));
-  } catch (error) {
-    return res.status(500).json({ error: 'Failed to parse manifest' });
+    const ipfsCid = CID.parse(cid);
+    
+    // For now, use IPFS gateway to fetch
+    // TODO: Use Synapse service download URL if we have user credentials
+    const ipfsUrl = `https://ipfs.io/ipfs/${cid}`;
+    logger.info({ event: 'fetch.manifest.ipfs', cid, url: ipfsUrl }, 'Fetching manifest from IPFS');
+    
+    const response = await fetch(ipfsUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch from IPFS: ${response.status} ${response.statusText}`);
+    }
+    
+    const manifestBytes = Buffer.from(await response.arrayBuffer());
+    
+    // Parse manifest to determine content type
+    let manifestData: any;
+    try {
+      manifestData = JSON.parse(manifestBytes.toString('utf-8'));
+    } catch (error) {
+      return res.status(500).json({ error: 'Failed to parse manifest' });
+    }
+    
+    // Determine content type
+    let contentType = 'application/vnd.docker.distribution.manifest.v2+json';
+    if (manifestData.mediaType) {
+      contentType = manifestData.mediaType;
+    } else if (manifestData.schemaVersion === 2) {
+      contentType = 'application/vnd.docker.distribution.manifest.v2+json';
+    } else {
+      contentType = 'application/vnd.oci.image.manifest.v1+json';
+    }
+    
+    // Compute digest from bytes
+    const hash = createHash('sha256');
+    hash.update(manifestBytes);
+    const digest = `sha256:${hash.digest('hex')}`;
+    
+    // Return manifest with proper headers
+    res.set({
+      'Content-Type': contentType,
+      'Docker-Content-Digest': digest,
+      'Content-Length': manifestBytes.length.toString(),
+    });
+    res.send(manifestBytes);
+  } catch (error: any) {
+    logger.error({ event: 'fetch.manifest.error', cid, error: error.message }, 'Failed to fetch manifest from IPFS');
+    return res.status(404).json({ error: `Failed to fetch manifest from IPFS: ${error.message}` });
   }
-  
-  // Determine content type based on manifest schema
-  let contentType = 'application/vnd.docker.distribution.manifest.v2+json';
-  if (manifestData.mediaType) {
-    contentType = manifestData.mediaType;
-  } else if (manifestData.schemaVersion === 2) {
-    contentType = 'application/vnd.docker.distribution.manifest.v2+json';
-  } else {
-    contentType = 'application/vnd.oci.image.manifest.v1+json';
-  }
-  
-  // Use the digest from the mapping (which matches what we stored)
-  // This ensures consistency with what Docker expects
-  const digest = manifestDigest;
-  
-  // Return manifest with proper headers
-  res.set({
-    'Content-Type': contentType,
-    'Docker-Content-Digest': digest,
-    'Content-Length': manifestBytes.length.toString(),
-  });
-  res.send(manifestBytes);
 });
 
 app.head('/v2/*/manifests/:reference', (req: Request, res: Response) => {
@@ -114,25 +205,22 @@ app.head('/v2/*/manifests/:reference', (req: Request, res: Response) => {
     return res.sendStatus(404);
   }
   
-  // Check if manifest exists locally
-  // The mapping stores the digest directly for local storage
-  const manifestDigest = cid.startsWith('sha256:') ? cid : null;
-  
-  if (!manifestDigest) {
-    // TODO: Check Filecoin Pin if CID is not a digest
-    return res.sendStatus(404);
+  // Check if manifest exists locally (digest) or in Filecoin Pin (IPFS CID)
+  if (cid.startsWith('sha256:')) {
+    const manifestPath = blobStorage.getManifestPath(cid);
+    if (!manifestPath) {
+      return res.sendStatus(404);
+    }
+    res.set({
+      'Docker-Content-Digest': cid,
+    });
+    res.sendStatus(200);
+    return;
   }
   
-  const manifestPath = blobStorage.getManifestPath(manifestDigest);
-  if (!manifestPath) {
-    // TODO: Check Filecoin Pin if not found locally
-    return res.sendStatus(404);
-  }
-  
-  // Return digest in header so Docker can resolve tag to digest
-  // This is critical for Docker to know which digest to pull
+  // IPFS CID - manifest exists in Filecoin Pin (we can't verify without fetching, but assume it exists)
   res.set({
-    'Docker-Content-Digest': manifestDigest,
+    'Docker-Content-Digest': cid, // Will be resolved to digest on GET
   });
   res.sendStatus(200);
 });
@@ -149,53 +237,117 @@ app.get('/v2/*/blobs/:digest', async (req: Request, res: Response) => {
     return res.status(404).json({ error: `Blob not found for digest ${digest}` });
   }
   
-  // TODO: Fetch blob from Filecoin Pin using CID
-  // For now, check local storage first
-  const blobPath = blobStorage.getBlobPath(digest);
-  
-  if (!blobPath) {
-    // TODO: Fetch from Filecoin Pin if not found locally
-    return res.status(404).json({ error: `Blob not found locally (digest: ${digest}, CID: ${cid})` });
-  }
-  
-  // Stream the blob from local filesystem
-  try {
-    const fs = await import('fs');
-    const stat = await fs.promises.stat(blobPath);
+  // Check if blob exists locally (digest lookup) or in Filecoin Pin (IPFS CID)
+  if (cid.startsWith('sha256:')) {
+    // Local storage - lookup by digest
+    const blobPath = blobStorage.getBlobPath(digest);
     
-    res.set({
-      'Content-Type': 'application/octet-stream',
-      'Docker-Content-Digest': digest,
-      'Content-Length': stat.size.toString(),
-    });
+    if (!blobPath) {
+      return res.status(404).json({ error: `Blob not found locally (digest: ${digest})` });
+    }
     
-    const stream = fs.createReadStream(blobPath);
-    
-    stream.on('data', (chunk: string | Buffer) => {
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      if (!res.write(buffer)) {
-        // If write buffer is full, pause the stream
-        stream.pause();
-        res.once('drain', () => stream.resume());
-      }
-    });
-    
-    stream.on('end', () => {
-      res.end();
-    });
-    
-    stream.on('error', (error: Error) => {
-      console.error(`Failed to read blob from filesystem: ${error}`);
+    // Stream the blob from local filesystem
+    try {
+      const fs = await import('fs');
+      const stat = await fs.promises.stat(blobPath);
+      
+      res.set({
+        'Content-Type': 'application/octet-stream',
+        'Docker-Content-Digest': digest,
+        'Content-Length': stat.size.toString(),
+      });
+      
+      const stream = fs.createReadStream(blobPath);
+      
+      stream.on('data', (chunk: string | Buffer) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        if (!res.write(buffer)) {
+          // If write buffer is full, pause the stream
+          stream.pause();
+          res.once('drain', () => stream.resume());
+        }
+      });
+      
+      stream.on('end', () => {
+        res.end();
+      });
+      
+      stream.on('error', (error: Error) => {
+        logger.error({ event: 'fetch.blob.error', digest, error: error.message }, 'Failed to read blob from filesystem');
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Failed to read blob from filesystem' });
+        } else {
+          res.destroy();
+        }
+      });
+    } catch (error: any) {
+      logger.error({ event: 'fetch.blob.error', digest, error: error.message }, 'Failed to fetch blob');
       if (!res.headersSent) {
-        res.status(500).json({ error: 'Failed to read blob from filesystem' });
+        res.status(404).json({ error: 'Failed to fetch blob' });
       } else {
         res.destroy();
       }
+    }
+    return;
+  }
+  
+  // IPFS CID - fetch from Filecoin Pin/IPFS
+  try {
+    const ipfsCid = CID.parse(cid);
+    
+    // For now, use IPFS gateway to fetch
+    // TODO: Use Synapse service download URL if we have user credentials
+    const ipfsUrl = `https://ipfs.io/ipfs/${cid}`;
+    logger.info({ event: 'fetch.blob.ipfs.start', cid, url: ipfsUrl }, 'Fetching blob from IPFS');
+    
+    const response = await fetch(ipfsUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch from IPFS: ${response.status} ${response.statusText}`);
+    }
+    
+    if (!response.body) {
+      throw new Error('Response body is null');
+    }
+    
+    // Stream the blob from IPFS
+    res.set({
+      'Content-Type': 'application/octet-stream',
+      'Docker-Content-Digest': digest,
     });
+    
+    const reader = response.body.getReader();
+    
+    const pump = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            res.end();
+            break;
+          }
+          
+          if (!res.write(value)) {
+            // If write buffer is full, wait for drain
+            await new Promise<void>((resolve) => res.once('drain', resolve));
+          }
+        }
+      } catch (error: any) {
+        logger.error({ event: 'fetch.blob.ipfs.error', cid, error: error.message }, 'Failed to stream blob from IPFS');
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Failed to stream blob from IPFS' });
+        } else {
+          res.destroy();
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    };
+    
+    pump();
   } catch (error: any) {
-    console.error(`Failed to fetch blob: ${error}`);
+    logger.error({ event: 'fetch.blob.error', digest, cid, error: error.message }, 'Failed to fetch blob from IPFS');
     if (!res.headersSent) {
-      res.status(404).json({ error: 'Failed to fetch blob' });
+      res.status(404).json({ error: `Failed to fetch blob from IPFS: ${error.message}` });
     } else {
       res.destroy();
     }
@@ -214,20 +366,26 @@ app.head('/v2/*/blobs/:digest', (req: Request, res: Response) => {
     return res.sendStatus(404);
   }
   
-  // Check if blob exists locally
-  if (!blobStorage.blobExists(digest)) {
-    // TODO: Check Filecoin Pin if not found locally
-    return res.sendStatus(404);
+  // Check if blob exists locally (digest lookup) or in Filecoin Pin (IPFS CID)
+  if (cid.startsWith('sha256:')) {
+    // Local storage
+    if (!blobStorage.blobExists(digest)) {
+      return res.sendStatus(404);
+    }
+    res.sendStatus(200);
+    return;
   }
   
+  // IPFS CID - blob exists in Filecoin Pin (we can't verify without fetching, but assume it exists)
   res.sendStatus(200);
 });
 
-// Push endpoints
+// Push endpoints - require authentication
+// OCI spec: push operations require authentication
 
 // Handle blob upload start - image name can contain slashes (e.g., "test/pincer-self-test")
 // Use wildcard pattern to match everything after /v2/ and before /blobs/uploads
-app.post('/v2/*/blobs/uploads', (req: Request, res: Response) => {
+app.post('/v2/*/blobs/uploads', requireAuth, (req: Request, res: Response) => {
   const pathMatch = req.path.match(/^\/v2\/(.+)\/blobs\/uploads\/?$/);
   if (!pathMatch) {
     return res.status(400).json({ error: 'Invalid path' });
@@ -248,7 +406,7 @@ app.post('/v2/*/blobs/uploads', (req: Request, res: Response) => {
 });
 
 // Also handle with trailing slash
-app.post('/v2/*/blobs/uploads/', (req: Request, res: Response) => {
+app.post('/v2/*/blobs/uploads/', requireAuth, (req: Request, res: Response) => {
   const pathMatch = req.path.match(/^\/v2\/(.+)\/blobs\/uploads\/?$/);
   if (!pathMatch) {
     return res.status(400).json({ error: 'Invalid path' });
@@ -277,7 +435,7 @@ function extractImageName(path: string, segment: string): string | null {
   return match ? match[1] : null;
 }
 
-app.patch('/v2/*/blobs/uploads/:uploadId', (req: Request, res: Response) => {
+app.patch('/v2/*/blobs/uploads/:uploadId', requireAuth, (req: Request, res: Response) => {
   // Extract name from path to handle slashes (e.g., "test/pincer-self-test")
   const name = extractImageName(req.path, 'blobs/uploads') || '';
   // Extract uploadId - it's the segment after /blobs/uploads/
@@ -311,7 +469,7 @@ app.patch('/v2/*/blobs/uploads/:uploadId', (req: Request, res: Response) => {
   res.send();
 });
 
-app.put('/v2/*/blobs/uploads/:uploadId', (req: Request, res: Response) => {
+app.put('/v2/*/blobs/uploads/:uploadId', requireAuth, async (req: Request, res: Response) => {
   // Extract name from path to handle slashes (e.g., "test/pincer-self-test")
   const name = extractImageName(req.path, 'blobs/uploads') || '';
   // Extract uploadId - it's the segment after /blobs/uploads/
@@ -329,17 +487,79 @@ app.put('/v2/*/blobs/uploads/:uploadId', (req: Request, res: Response) => {
     blobStorage.appendChunk(uploadId, chunkData);
   }
   
-  // Complete upload and save blob
+  // Complete upload and save blob to local storage
   const actualDigest = blobStorage.completeUpload(uploadId, digest);
   
-  // Store blob mapping (digest -> placeholder CID for now)
-  // TODO: Replace with actual Filecoin Pin CID
-  const placeholderCid = `stub_cid_${actualDigest.replace('sha256:', '').slice(0, 16)}`;
+  // Get credentials from auth middleware
+  const credentials = (req as any).auth as AuthCredentials;
   
-  // Add blob mapping
-  const blobMapping = imageMapping.getBlobCid(name, actualDigest);
-  if (!blobMapping) {
-    // Get or create blob mappings for this image
+  // Get Synapse service for this user
+  const synapseService = await getSynapseService(credentials, config, logger);
+  
+  // Get blob path to read the data
+  const blobPath = blobStorage.getBlobPath(actualDigest);
+  if (!blobPath) {
+    return res.status(500).json({ error: 'Failed to locate saved blob' });
+  }
+  
+  // Read blob data first so we know the piece size
+  const fs = await import('fs');
+  const blobData = await fs.promises.readFile(blobPath);
+  
+  // Note: Deposit/approval should be done beforehand using the synapse-deposit.ts script
+  // We proceed directly to upload assuming funds are already deposited
+  
+  // Create CAR file from blob bytes (this is fast, just computing the CID)
+  const { carData, rootCid } = await createCarFromBytes(blobData, logger);
+  const ipfsCid = rootCid.toString();
+  
+  // Store blob mapping initially with digest (for local storage)
+  // We'll update to IPFS CID after async upload completes
+  // This ensures pulls work immediately from local storage
+  imageMapping.updateMappings((mappings) => {
+    if (!mappings[name] || typeof mappings[name] === 'string') {
+      mappings[name] = { blobs: {} };
+    }
+    const imageData = mappings[name];
+    if (typeof imageData === 'object' && !Array.isArray(imageData) && 'blobs' in imageData) {
+      const data = imageData as { blobs?: Record<string, string> };
+      if (!data.blobs) {
+        data.blobs = {};
+      }
+      // Store digest initially - will be updated to IPFS CID after upload completes
+      data.blobs[actualDigest] = actualDigest; // Use digest for local storage lookup
+    }
+  });
+  
+  // Send response to Docker immediately (don't wait for Filecoin Pin upload)
+  const location = `/v2/${name}/blobs/${actualDigest}`;
+  res.status(201);
+  res.set({
+    'Location': location,
+    'Docker-Content-Digest': actualDigest,
+    'Content-Length': '0',
+  });
+  res.send();
+  
+  // Upload to Filecoin Pin asynchronously in the background
+  // This can take a while (needs blockchain confirmations), so we don't block the response
+  logger.info({ event: 'upload.blob.synapse.start', cid: ipfsCid }, 'Starting async upload to Filecoin Pin');
+  executeUpload(synapseService, carData, rootCid, {
+    logger,
+    contextId: `blob-${actualDigest}`,
+    metadata: {
+      type: 'oci-blob',
+      digest: actualDigest,
+      imageName: name,
+    },
+  }).then((uploadResult) => {
+    logger.info(
+      { event: 'upload.blob.synapse.success', cid: ipfsCid, pieceCid: uploadResult.pieceCid },
+      'Blob uploaded to Filecoin Pin (async)'
+    );
+    
+    // Now update the mapping to use IPFS CID instead of digest
+    // This allows pulls to work from IPFS once the upload completes
     imageMapping.updateMappings((mappings) => {
       if (!mappings[name] || typeof mappings[name] === 'string') {
         mappings[name] = { blobs: {} };
@@ -350,30 +570,43 @@ app.put('/v2/*/blobs/uploads/:uploadId', (req: Request, res: Response) => {
         if (!data.blobs) {
           data.blobs = {};
         }
-        data.blobs[actualDigest] = placeholderCid;
+        // Update to IPFS CID now that upload is complete
+        data.blobs[actualDigest] = ipfsCid;
+        logger.info({ event: 'mapping.updated', digest: actualDigest, cid: ipfsCid }, `Updated blob mapping to use IPFS CID: ${ipfsCid}`);
       }
     });
-  }
-  
-  const location = `/v2/${name}/blobs/${actualDigest}`;
-  
-  res.status(201);
-  res.set({
-    'Location': location,
-    'Docker-Content-Digest': actualDigest,
-    'Content-Length': '0',
+  }).catch((error: any) => {
+    logger.error({ event: 'upload.blob.synapse.error', cid: ipfsCid, error: error.message }, 'Failed to upload blob to Filecoin Pin (async)');
+    
+    // Log specific errors but don't fail the request (already sent response)
+    if (error.message?.includes('InsufficientFunds') || error.message?.includes('Insufficient')) {
+      try {
+        synapseService.synapse.getClient().getAddress().then((walletAddress: string) => {
+          logger.error({ event: 'upload.blob.insufficient_funds', address: walletAddress }, 
+            `❌ Insufficient USDFC (USD Filecoin) funds in wallet ${walletAddress} for async upload. ` +
+            `Fund your wallet at: https://forest-explorer.chainsafe.dev/faucet/calibnet_usdfc`
+          );
+        }).catch(() => {
+          // Ignore errors getting address
+        });
+      } catch {
+        // Ignore errors
+      }
+    }
   });
-  res.send();
 });
 
-app.put('/v2/*/manifests/:reference', (req: Request, res: Response) => {
+app.put('/v2/*/manifests/:reference', requireAuth, async (req: Request, res: Response) => {
   // Extract name from path to handle slashes (e.g., "test/pincer-self-test")
   const name = extractImageName(req.path, 'manifests') || '';
   const reference = req.path.split('/manifests/').pop()?.split('?')[0] || '';
   
+  logger.info({ event: 'manifest.put.start', name, reference }, `Received manifest PUT request for ${name}:${reference}`);
+  
   const manifestBytes = req.body as Buffer;
   
   if (!manifestBytes || manifestBytes.length === 0) {
+    logger.error({ event: 'manifest.put.error', name, reference }, 'No manifest data provided');
     return res.status(400).json({ error: 'No manifest data provided' });
   }
   
@@ -382,57 +615,78 @@ app.put('/v2/*/manifests/:reference', (req: Request, res: Response) => {
   try {
     manifestData = JSON.parse(manifestBytes.toString('utf-8'));
   } catch (error) {
+    logger.error({ event: 'manifest.put.error', name, reference, error }, 'Invalid JSON manifest');
     return res.status(400).json({ error: 'Invalid JSON manifest' });
   }
 
   // Save manifest to local storage - use the raw bytes to preserve exact digest
   const manifestDigest = blobStorage.saveManifest(name, reference, manifestBytes);
+  logger.info({ event: 'manifest.saved', digest: manifestDigest }, `Saved manifest ${manifestDigest} for ${name}:${reference}`);
   
-  // For local storage, store the digest directly (not a CID)
-  // TODO: When uploading to Filecoin Pin, replace with actual CID
-  // For now, we use the digest as the lookup key since files are stored by digest locally
+  // Create CAR file from manifest bytes (this is fast, just computing the CID)
+  logger.info({ event: 'upload.manifest.start', digest: manifestDigest, size: manifestBytes.length }, 'Creating CAR file from manifest');
+  let carData: Uint8Array;
+  let rootCid: CID;
+  let ipfsCid: string;
+  try {
+    const result = await createCarFromBytes(manifestBytes, logger);
+    carData = result.carData;
+    rootCid = result.rootCid;
+    ipfsCid = rootCid.toString();
+    logger.info({ event: 'car.created', cid: ipfsCid }, `Created CAR file with CID ${ipfsCid}`);
+  } catch (error: any) {
+    logger.error({ event: 'car.create.error', error: error.message }, 'Failed to create CAR file');
+    // Use digest as fallback
+    ipfsCid = manifestDigest;
+    carData = new Uint8Array(0); // Empty, won't be used since we're using digest fallback
+    rootCid = CID.parse('bafkqaaa'); // Dummy CID, won't be used
+  }
   
-  // Extract layer digests and create blob mappings
+  // Extract layer digests and create blob mappings (do this before upload so we have the mappings)
   const layers = parseManifestLayers(manifestData);
   const blobMappings: Record<string, string> = {};
   
   for (const layer of layers) {
     const layerDigest = layer.digest;
     if (layerDigest) {
-      // Check if blob exists locally
-      if (blobStorage.blobExists(layerDigest)) {
-        // For local storage, we can use the digest itself or a placeholder
-        // The blob mapping isn't strictly needed for local storage since we look up by digest
-        // But we'll store a placeholder for future Filecoin Pin integration
-        const blobCid = `stub_cid_${layerDigest.replace('sha256:', '').slice(0, 16)}`;
+      // Look up blob CID from mapping (should already be uploaded)
+      const blobCid = imageMapping.getBlobCid(name, layerDigest);
+      if (blobCid) {
         blobMappings[layerDigest] = blobCid;
       }
     }
   }
   
-  // Store manifest mapping - use digest for local storage lookup
-  // TODO: When Filecoin Pin is integrated, store actual CID here
-  imageMapping.addMapping(
-    name,
-    reference,
-    manifestDigest, // Store digest directly for local storage lookup
-    Object.keys(blobMappings).length > 0 ? blobMappings : undefined
-  );
-  
-  // Also store mapping for the digest itself, so Docker can pull by digest
-  // Docker resolves tag -> digest via HEAD, then pulls by digest
-  if (reference !== manifestDigest) {
+  // Store manifest mapping immediately (use IPFS CID or digest as fallback)
+  // We store the CID even before upload completes, so pulls can work
+  logger.info({ event: 'mapping.save.start', name, reference, cid: ipfsCid }, `Saving manifest mapping for ${name}:${reference}`);
+  try {
     imageMapping.addMapping(
       name,
-      manifestDigest, // Store digest as its own reference
-      manifestDigest,
+      reference,
+      ipfsCid, // Store IPFS CID for Filecoin Pin lookup (or digest as fallback)
       Object.keys(blobMappings).length > 0 ? blobMappings : undefined
     );
-    console.log(`Also stored manifest ${manifestDigest} for ${name}:${manifestDigest}`);
+    logger.info({ event: 'mapping.saved', name, reference, cid: ipfsCid }, `Saved manifest mapping for ${name}:${reference}`);
+    
+    // Also store mapping for the digest itself, so Docker can pull by digest
+    // Docker resolves tag -> digest via HEAD, then pulls by digest
+    if (reference !== manifestDigest) {
+      imageMapping.addMapping(
+        name,
+        manifestDigest, // Store digest as its own reference
+        ipfsCid, // But still use IPFS CID for lookup (or digest as fallback)
+        Object.keys(blobMappings).length > 0 ? blobMappings : undefined
+      );
+      logger.info({ event: 'mapping.stored', digest: manifestDigest, cid: ipfsCid }, `Also stored manifest ${manifestDigest} for ${name}:${manifestDigest}`);
+    }
+  } catch (error: any) {
+    logger.error({ event: 'mapping.save.error', name, reference, error: error.message }, `Failed to save manifest mapping: ${error.message}`);
+    // Continue anyway - we'll try to send response
   }
   
-  console.log(`Stored manifest ${manifestDigest} for ${name}:${reference}`);
-  
+  // Send response to Docker immediately (don't wait for Filecoin Pin upload)
+  logger.info({ event: 'manifest.put.response', name, reference, digest: manifestDigest }, `Sending response for ${name}:${reference}`);
   res.status(201);
   res.set({
     'Docker-Content-Digest': manifestDigest,
@@ -440,6 +694,46 @@ app.put('/v2/*/manifests/:reference', (req: Request, res: Response) => {
     'Content-Length': manifestBytes.length.toString(),
   });
   res.send();
+  
+  // Get credentials from auth middleware (for async upload)
+  const credentials = (req as any).auth as AuthCredentials;
+  
+  // Upload manifest to Filecoin Pin asynchronously in the background
+  // This can take a while (needs blockchain confirmations), so we don't block the response
+  logger.info({ event: 'upload.manifest.synapse.start', cid: ipfsCid }, 'Starting async upload to Filecoin Pin');
+  getSynapseService(credentials, config, logger).then((synapseService) => {
+    return executeUpload(synapseService, carData, rootCid, {
+      logger,
+      contextId: `manifest-${manifestDigest}`,
+      metadata: {
+        type: 'oci-manifest',
+        digest: manifestDigest,
+        imageName: name,
+        reference: reference,
+      },
+    });
+  }).then((uploadResult) => {
+    logger.info(
+      { event: 'upload.manifest.synapse.success', cid: ipfsCid, pieceCid: uploadResult.pieceCid },
+      'Manifest uploaded to Filecoin Pin (async)'
+    );
+  }).catch((error: any) => {
+    logger.error({ event: 'upload.manifest.synapse.error', cid: ipfsCid, error: error.message }, 'Failed to upload manifest to Filecoin Pin (async)');
+    
+    // Log specific errors but don't fail the request (already sent response)
+    if (error.message?.includes('InsufficientFunds') || error.message?.includes('Insufficient')) {
+      getSynapseService(credentials, config, logger).then((synapseService) => {
+        return synapseService.synapse.getClient().getAddress();
+      }).then((walletAddress: string) => {
+        logger.error({ event: 'upload.manifest.insufficient_funds', address: walletAddress }, 
+          `❌ Insufficient USDFC (USD Filecoin) funds in wallet ${walletAddress} for async upload. ` +
+          `Fund your wallet at: https://forest-explorer.chainsafe.dev/faucet/calibnet_usdfc`
+        );
+      }).catch(() => {
+        // Ignore errors getting address
+      });
+    }
+  });
 });
 
 app.get('/health', (req: Request, res: Response) => {
@@ -456,8 +750,27 @@ if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith
   const port = config!.port;
   const host = config!.host;
 
-  app.listen(port, host as any, () => {
-    console.log(`PinCeR server listening on ${host}:${port}`);
+  const server = app.listen(port, host as any, () => {
+    logger.info({ event: 'pincer.server.start', host, port }, `PinCeR server listening on ${host}:${port}`);
+  });
+
+  // Cleanup on shutdown
+  process.on('SIGINT', async () => {
+    logger.info({ event: 'pincer.shutdown' }, 'Shutting down PinCeR...');
+    await cleanupAllServices();
+    server.close(() => {
+      logger.info({ event: 'pincer.shutdown.complete' }, 'PinCeR stopped');
+      process.exit(0);
+    });
+  });
+
+  process.on('SIGTERM', async () => {
+    logger.info({ event: 'pincer.shutdown' }, 'Shutting down PinCeR...');
+    await cleanupAllServices();
+    server.close(() => {
+      logger.info({ event: 'pincer.shutdown.complete' }, 'PinCeR stopped');
+      process.exit(0);
+    });
   });
 }
 

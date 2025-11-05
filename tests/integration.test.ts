@@ -54,6 +54,14 @@ const DOCKER_HOST = process.platform === 'darwin' || process.platform === 'win32
 const TEST_REGISTRY = `${DOCKER_HOST}:${PINCER_PORT}`;
 const TEST_IMAGE = `test/pincer-self-test:latest`;
 
+// Get private key from environment variable
+const TEST_PRIVATE_KEY = process.env.TEST_PRIVATE_KEY;
+if (!TEST_PRIVATE_KEY) {
+  console.warn('⚠️  TEST_PRIVATE_KEY environment variable not set');
+  console.warn('   Set TEST_PRIVATE_KEY to run integration tests with Filecoin Pin');
+  console.warn('   Example: TEST_PRIVATE_KEY=0x1234... npm test');
+}
+
 describe('PinCeR Self-Containerization Test', () => {
   let server: Server | null = null;
   const testStorageDir = join(process.cwd(), 'test_storage');
@@ -189,6 +197,14 @@ describe('PinCeR Self-Containerization Test', () => {
   });
 
   it('should containerize PinCeR and push it to itself', async () => {
+    // Skip test if private key not provided
+    if (!TEST_PRIVATE_KEY) {
+      console.warn('⚠️  Skipping push test - TEST_PRIVATE_KEY not set');
+      console.warn('   Set TEST_PRIVATE_KEY environment variable to run this test');
+      console.warn('   Example: TEST_PRIVATE_KEY=0x1234... npm test');
+      return;
+    }
+
     console.log('🐳 Building PinCeR Docker image...');
     try {
       const { stdout: buildOutput } = await execAsync(
@@ -205,6 +221,42 @@ describe('PinCeR Self-Containerization Test', () => {
     }
 
     console.log('🏷️  Image tagged for local registry');
+
+    // Login to Docker registry with private key
+    console.log('🔐 Logging in to PinCeR registry...');
+    try {
+      // Use printf to avoid shell interpretation issues with special characters
+      // docker login expects username:password format via stdin
+      const loginCmd = `echo "${TEST_PRIVATE_KEY}" | docker login ${TEST_REGISTRY} -u testuser --password-stdin`;
+      const { stdout: loginOutput, stderr: loginStderr } = await execAsync(loginCmd, {
+        timeout: 10000,
+      });
+      console.log('✅ Docker login successful');
+      if (loginOutput) console.log('Login output:', loginOutput);
+      
+      // Verify Docker stored credentials (debug)
+      try {
+        const { stdout: configCheck } = await execAsync(
+          `cat ~/.docker/config.json 2>/dev/null | grep -A 5 "${TEST_REGISTRY}" || echo "Credentials not found in config"`,
+          { timeout: 2000 }
+        );
+        console.log('📋 Docker config check:', configCheck.trim().substring(0, 200));
+      } catch {
+        // Ignore if config doesn't exist or can't be read
+      }
+    } catch (error: any) {
+      const errorMsg = error.message || error.stderr || '';
+      if (errorMsg.includes('unauthorized') || errorMsg.includes('401')) {
+        console.error('❌ Docker login failed - authentication error');
+        console.error('   Check that TEST_PRIVATE_KEY is set correctly');
+        throw error;
+      }
+      console.error('❌ Docker login failed:', error.message);
+      if (error.stderr) {
+        console.error('Login stderr:', error.stderr);
+      }
+      throw error;
+    }
 
     console.log(`📤 Pushing ${TEST_IMAGE} to PinCeR at ${TEST_REGISTRY}...`);
     console.log(`   (Docker will connect to http://${TEST_REGISTRY}/v2/)`);
@@ -328,7 +380,7 @@ describe('PinCeR Self-Containerization Test', () => {
     try {
       const { stdout: pushOutput, stderr: pushStderr } = await execAsync(
         `docker push ${TEST_REGISTRY}/${TEST_IMAGE}`,
-        { timeout: 120000 } // 2 minute timeout
+        { timeout: 300000 } // 5 minute timeout - Filecoin Pin uploads can take time
       );
       
       if (pushStderr && !pushStderr.includes('digest:') && !pushStderr.includes('pushed')) {
@@ -398,10 +450,26 @@ describe('PinCeR Self-Containerization Test', () => {
   }, 180000);
 
   it('should be able to pull PinCeR from itself', async () => {
-    // Skip if push failed
+    // Skip if push failed or private key not provided
+    if (!TEST_PRIVATE_KEY) {
+      console.warn('⚠️  Skipping pull test - TEST_PRIVATE_KEY not set');
+      return;
+    }
+
     if (!existsSync(testMappingFile)) {
       console.warn('⚠️  Pull test skipped - push test did not complete successfully');
       return;
+    }
+
+    // Login to Docker registry with private key
+    console.log('🔐 Logging in to PinCeR registry for pull...');
+    try {
+      const loginCmd = `echo "${TEST_PRIVATE_KEY}" | docker login ${TEST_REGISTRY} -u testuser --password-stdin`;
+      await execAsync(loginCmd, { timeout: 10000 });
+      console.log('✅ Docker login successful');
+    } catch (error: any) {
+      console.error('❌ Docker login failed:', error.message);
+      throw error;
     }
 
     console.log(`📥 Pulling ${TEST_IMAGE} from PinCeR...`);
