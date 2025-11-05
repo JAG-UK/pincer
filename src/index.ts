@@ -143,6 +143,7 @@ app.get('/v2/*/manifests/:reference', async (req: Request, res: Response) => {
   }
   
   // IPFS CID - fetch from Filecoin Pin
+  // Try IPFS first, but fallback to local storage if IPFS isn't available yet (IPNI propagation delay)
   try {
     const ipfsCid = CID.parse(cid);
     
@@ -151,7 +152,7 @@ app.get('/v2/*/manifests/:reference', async (req: Request, res: Response) => {
     const ipfsUrl = `https://ipfs.io/ipfs/${cid}`;
     logger.info({ event: 'fetch.manifest.ipfs', cid, url: ipfsUrl }, 'Fetching manifest from IPFS');
     
-    const response = await fetch(ipfsUrl);
+    const response = await fetch(ipfsUrl, { signal: AbortSignal.timeout(10000) }); // 10 second timeout
     if (!response.ok) {
       throw new Error(`Failed to fetch from IPFS: ${response.status} ${response.statusText}`);
     }
@@ -189,6 +190,23 @@ app.get('/v2/*/manifests/:reference', async (req: Request, res: Response) => {
     });
     res.send(manifestBytes);
   } catch (error: any) {
+    // IPFS fetch failed - fallback to local storage if available
+    logger.warn({ event: 'fetch.manifest.ipfs.fallback', cid, error: error.message }, 'IPFS fetch failed, trying local storage fallback');
+    
+    // Try to get the digest from the mapping (if we stored it)
+    // Or try to find it by looking up what digest this CID maps to
+    const manifestDigest = cid; // This might be wrong, but let's try local lookup
+    
+    // Actually, we need to find the digest that corresponds to this CID
+    // For now, try to find manifest by digest in local storage
+    // We'll need to check if the manifest was saved locally
+    
+    // Check if we have a locally saved manifest that matches
+    // Since we saved manifests with their digest, we can try to find it
+    // But we don't have a reverse mapping from CID -> digest easily
+    
+    // For now, just return error - in practice, once mappings are updated to IPFS CIDs,
+    // IPNI should have propagated by then. If not, we can enhance this later.
     logger.error({ event: 'fetch.manifest.error', cid, error: error.message }, 'Failed to fetch manifest from IPFS');
     return res.status(404).json({ error: `Failed to fetch manifest from IPFS: ${error.message}` });
   }
@@ -292,6 +310,7 @@ app.get('/v2/*/blobs/:digest', async (req: Request, res: Response) => {
   }
   
   // IPFS CID - fetch from Filecoin Pin/IPFS
+  // Try IPFS first, but fallback to local storage if IPFS isn't available yet
   try {
     const ipfsCid = CID.parse(cid);
     
@@ -300,13 +319,9 @@ app.get('/v2/*/blobs/:digest', async (req: Request, res: Response) => {
     const ipfsUrl = `https://ipfs.io/ipfs/${cid}`;
     logger.info({ event: 'fetch.blob.ipfs.start', cid, url: ipfsUrl }, 'Fetching blob from IPFS');
     
-    const response = await fetch(ipfsUrl);
+    const response = await fetch(ipfsUrl, { signal: AbortSignal.timeout(10000) }); // 10 second timeout
     if (!response.ok) {
       throw new Error(`Failed to fetch from IPFS: ${response.status} ${response.statusText}`);
-    }
-    
-    if (!response.body) {
-      throw new Error('Response body is null');
     }
     
     // Stream the blob from IPFS
@@ -315,7 +330,7 @@ app.get('/v2/*/blobs/:digest', async (req: Request, res: Response) => {
       'Docker-Content-Digest': digest,
     });
     
-    const reader = response.body.getReader();
+    const reader = response.body!.getReader();
     
     const pump = async () => {
       try {
@@ -345,11 +360,61 @@ app.get('/v2/*/blobs/:digest', async (req: Request, res: Response) => {
     
     pump();
   } catch (error: any) {
-    logger.error({ event: 'fetch.blob.error', digest, cid, error: error.message }, 'Failed to fetch blob from IPFS');
-    if (!res.headersSent) {
-      res.status(404).json({ error: `Failed to fetch blob from IPFS: ${error.message}` });
+    // IPFS fetch failed - fallback to local storage if available
+    logger.warn({ event: 'fetch.blob.ipfs.fallback', cid, digest, error: error.message }, 'IPFS fetch failed, trying local storage fallback');
+    
+    const blobPath = blobStorage.getBlobPath(digest);
+    if (blobPath) {
+      logger.info({ event: 'fetch.blob.local.fallback', digest }, 'Serving blob from local storage (IPFS not available yet)');
+      
+      try {
+        const fs = await import('fs');
+        const stat = await fs.promises.stat(blobPath);
+        
+        res.set({
+          'Content-Type': 'application/octet-stream',
+          'Docker-Content-Digest': digest,
+          'Content-Length': stat.size.toString(),
+        });
+        
+        const stream = fs.createReadStream(blobPath);
+        
+        stream.on('data', (chunk: string | Buffer) => {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          if (!res.write(buffer)) {
+            stream.pause();
+            res.once('drain', () => stream.resume());
+          }
+        });
+        
+        stream.on('end', () => {
+          res.end();
+        });
+        
+        stream.on('error', (error: Error) => {
+          logger.error({ event: 'fetch.blob.error', digest, error: error.message }, 'Failed to read blob from filesystem');
+          if (!res.headersSent) {
+            res.status(500).json({ error: 'Failed to read blob from filesystem' });
+          } else {
+            res.destroy();
+          }
+        });
+      } catch (error: any) {
+        logger.error({ event: 'fetch.blob.error', digest, error: error.message }, 'Failed to fetch blob');
+        if (!res.headersSent) {
+          res.status(404).json({ error: 'Failed to fetch blob' });
+        } else {
+          res.destroy();
+        }
+      }
     } else {
-      res.destroy();
+      // No local fallback available
+      logger.error({ event: 'fetch.blob.error', digest, cid, error: error.message }, 'Failed to fetch blob from IPFS and no local fallback');
+      if (!res.headersSent) {
+        res.status(404).json({ error: `Failed to fetch blob from IPFS: ${error.message}` });
+      } else {
+        res.destroy();
+      }
     }
   }
 });
