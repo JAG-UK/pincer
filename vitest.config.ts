@@ -4,7 +4,7 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
-    testTimeout: 180000, // 3 minutes for integration tests
+    testTimeout: 600000, // 10 minutes for integration tests (Filecoin Pin uploads can take time)
   },
 });
 

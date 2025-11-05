@@ -80,7 +80,21 @@ Or in development mode:
 npm run dev
 ```
 
-### 2. Build and Push Images
+### 2. Authenticate with Docker
+
+PinCeR requires authentication for push operations (pull can be public or authenticated). Use your Ethereum private key:
+
+```bash
+# Login with your private key (password is your private key)
+docker login localhost:5002 -u myuser -p 0x1234567890abcdef...
+
+# Or with Bearer token format
+echo "0x1234567890abcdef..." | docker login localhost:5002 -u myuser --password-stdin
+```
+
+**Note**: The private key can be provided with or without the `0x` prefix - PinCeR will normalize it automatically.
+
+### 3. Build and Push Images
 
 Use standard Docker/OCI tools - no special configuration needed:
 
@@ -141,17 +155,25 @@ npm run test:coverage
 PinCeR includes a meta test that builds PinCeR itself as a Docker image and pushes it to its own registry! This demonstrates the full push/pull cycle:
 
 ```bash
+# Set your private key (merges `docker login` with Synapse private key auth)
+export TEST_PRIVATE_KEY=0x1234567890abcdef...
+
+# Run the integration test
 npm test -- tests/integration.test.ts
 ```
 
-**⚠️ Docker Configuration Required**: This test requires Docker to be configured for insecure registries. See [DOCKER_CONFIG.md](./DOCKER_CONFIG.md) for detailed instructions.
+**⚠️ Requirements**:
+- **TEST_PRIVATE_KEY**: Set this environment variable with your Ethereum private key (with or without `0x` prefix). This key must have USDFC (USD Filecoin) for Synapse operations.
+- **Docker Configuration**: Docker must be configured for insecure registries. See below.
+
+**Note**: The test will skip if `TEST_PRIVATE_KEY` is not set, with a helpful warning message.
 
 **Quick setup for Docker Desktop (macOS/Windows)**:
 1. Open Docker Desktop → **Settings** → **Docker Engine**
 2. Add to the JSON configuration:
    ```json
    {
-     "insecure-registries": ["localhost:5001"]
+     "insecure-registries": ["localhost:5001", "localhost:5002"]
    }
    ```
    (Note: Test uses port 5001, main server uses 5002 by default)
@@ -164,23 +186,6 @@ npm test -- tests/integration.test.ts
 }
 ```
 Then restart: `sudo systemctl restart docker`
-
-## Project Structure
-
-```
-pincer/
-├── src/
-│   ├── index.ts          # Express server (main entry point)
-│   ├── config.ts         # Configuration management
-│   ├── mapping.ts        # Image→CID mapping system
-│   ├── storage.ts        # Blob storage (staging for Filecoin Pin)
-│   ├── ipfs.ts           # IPFS fetching utilities
-│   └── utils.ts          # OCI utility functions
-├── dist/                 # Compiled JavaScript (generated)
-├── package.json          # Node.js dependencies
-├── tsconfig.json         # TypeScript configuration
-└── README.md             # This file
-```
 
 ## How It Works Internally
 
@@ -200,22 +205,6 @@ When you pull an image:
 3. **Layer Resolution**: Maps layer digests → IPFS CIDs from stored mappings
 4. **Layer Streaming**: Streams layers from IPFS gateways
 5. **Standard Response**: Serves content with proper OCI headers
-
-## Limitations
-
-- **Filecoin Pin Integration**: Currently uses placeholder for Filecoin Pin uploads (to be implemented)
-- **No authentication**: Doesn't implement registry authentication (can be added)
-- **Single gateway**: Uses one IPFS gateway at a time (can be extended for failover)
-
-## Future Improvements
-
-- [ ] Complete Filecoin Pin API integration
-- [ ] Support for multiple IPFS gateways with failover
-- [ ] Authentication support (Docker registry auth)
-- [ ] Caching layer for faster pulls
-- [ ] Health checks and metrics
-- [ ] Support for manifest lists (multi-arch images)
-- [ ] Repository and tag listing endpoints (`GET /v2/_catalog`, `GET /v2/{name}/tags/list`)
 
 ## License
 
