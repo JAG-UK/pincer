@@ -5,11 +5,10 @@
 ## Features
 
 - ✅ **Full OCI Distribution Spec** - Supports both push and pull operations
-- ✅ **Standard Docker/containerd tools** - Works with `docker push/pull`, `crane`, `skopeo`, etc.
+- ✅ **Standard Docker/containerd tools** - Works with `docker login`, `docker push/pull`, etc.
 - ✅ **Automatic Filecoin Pin integration** - Images are automatically uploaded to Filecoin Pin when pushed
-- ✅ **IPFS-backed storage** - Images are stored in IPFS and served via IPFS gateways
-- ✅ **Content-addressable** - Uses IPFS CIDs for immutable, content-addressable storage
-- ✅ **Zero configuration** - Push images normally, PinCeR handles everything
+- ✅ **IPFS-backed storage** - Stored layers can be served via IPFS gateways
+- ✅ **Zero user changes** - Push and pull images normally, PinCeR handles all the Filecoin specifics
 
 ## Architecture
 
@@ -24,38 +23,23 @@ Pull:  Docker/containerd → PinCeR → IPFS Gateway → Filecoin Pin
 
 1. **Push Flow**: When you `docker push` to PinCeR:
    - PinCeR receives manifest and layer blobs via standard OCI API
-   - Uploads content to Filecoin Pin and gets IPFS CIDs
-   - Automatically maps `image:tag` → IPFS CIDs
-   - No manual configuration needed
+   - Stores a temporary staging local copy and deals with mappings, CIDs etc
+   - Uploads content to Filecoin Pin and gets back final IPFS CIDs
+   - **Note** uploading large layers to Filecoin Pin takes longer than the docker timeout, so jobs complete asynchronously
 
 2. **Pull Flow**: When you `docker pull` from PinCeR:
    - PinCeR looks up `image:tag` → IPFS CID mapping
    - Fetches manifest and layers from IPFS gateways
-   - Serves content with proper OCI headers
-   - Works exactly like any other registry
+   - Serves content with proper OCI headers like any other registry
 
 ## Installation
 
 ### Prerequisites
 
-- Node.js 18+ 
+- Node.js 20+ 
 - npm or yarn
 
 ### Setup
-
-```bash
-# Install dependencies
-npm install
-
-# Build the project
-npm run build
-
-# Start the server
-npm start
-
-# Or run in development mode (with auto-reload)
-npm run dev
-```
 
 ## Configuration
 
@@ -85,14 +69,12 @@ npm run dev
 PinCeR requires authentication for push operations (pull can be public or authenticated). Use your Ethereum private key:
 
 ```bash
-# Login with your private key (password is your private key)
+# Login with your Fielcoin Pin private key (password is your private key)
 docker login localhost:5002 -u myuser -p 0x1234567890abcdef...
-
-# Or with Bearer token format
-echo "0x1234567890abcdef..." | docker login localhost:5002 -u myuser --password-stdin
 ```
 
 **Note**: The private key can be provided with or without the `0x` prefix - PinCeR will normalize it automatically.
+**Note**: Use use --password-stdin for more secure ways of providing the private key
 
 ### 3. Build and Push Images
 
@@ -124,9 +106,9 @@ docker pull localhost:5002/myapp:latest
 docker run localhost:5002/myapp:latest
 ```
 
-### 4. Configure Docker/containerd (Optional)
+### 4. Configure Docker/containerd
 
-For production use, configure your container runtime:
+⚠️ **WARNING** At the moment PinCeR only runs as a local proxy over HTTP so it has to be added to `insecure-registries`. If you host yours somewhere with TLS then this step won't be necessary.
 
 ```bash
 # Docker: Add to /etc/docker/daemon.json
@@ -150,6 +132,37 @@ npm test
 npm run test:coverage
 ```
 
+### Getting a wallet
+
+If you don't have a wallet/private key to use with Filecoin Pin you can make one easily with Foundry:
+
+```bash
+$cast wallet new
+
+Successfully created new keypair.
+Address:     0x<hex of the wallet address - use this at faucets and in transactions>
+Private key: 0x<hex of private key - keep this safe and use with 'docker login' or Synapse init>
+```
+
+### Funding your wallet
+
+1. Get funds and get an ActorID for your wallet (calibnet): https://beryx.io/faucet
+2. Get USDFC: https://forest-explorer.chainsafe.dev/faucet/calibnet_usdfc
+3. Move USDFC to the payment contract:
+
+Filecoin Pin requires an amount of setup for your wallet to work. A utility is provided to make this easier:
+
+```bash
+# One time authorise the contract and move USDFC funds from the wallet to WarmStorgae
+APPROVE_SERVICE=true DEPOSIT_AMOUNT=5 npm run tools:deposit
+
+# Subsequent times just move USDFC funds
+DEPOSIT_AMOUNT=5 npm run tools:deposit
+
+# Or just check your balances
+npm run tools:deposit
+```
+
 ### Self-Containerization Test
 
 PinCeR includes a meta test that builds PinCeR itself as a Docker image and pushes it to its own registry! This demonstrates the full push/pull cycle:
@@ -164,47 +177,10 @@ npm test -- tests/integration.test.ts
 
 **⚠️ Requirements**:
 - **TEST_PRIVATE_KEY**: Set this environment variable with your Ethereum private key (with or without `0x` prefix). This key must have USDFC (USD Filecoin) for Synapse operations.
-- **Docker Configuration**: Docker must be configured for insecure registries. See below.
+- **Docker Configuration**: Docker must be configured for insecure registries. See above.
 
 **Note**: The test will skip if `TEST_PRIVATE_KEY` is not set, with a helpful warning message.
 
-**Quick setup for Docker Desktop (macOS/Windows)**:
-1. Open Docker Desktop → **Settings** → **Docker Engine**
-2. Add to the JSON configuration:
-   ```json
-   {
-     "insecure-registries": ["localhost:5001", "localhost:5002"]
-   }
-   ```
-   (Note: Test uses port 5001, main server uses 5002 by default)
-3. Click **Apply & Restart**
-
-**Linux**: Add to `/etc/docker/daemon.json`:
-```json
-{
-  "insecure-registries": ["localhost:5001", "localhost:5002"]
-}
-```
-Then restart: `sudo systemctl restart docker`
-
-## How It Works Internally
-
-When you push an image:
-
-1. **Blob Upload**: Docker uploads each layer blob via `POST /v2/{name}/blobs/uploads/`
-2. **Filecoin Pin**: PinCeR uploads the blob to Filecoin Pin and receives an IPFS CID
-3. **Mapping Storage**: PinCeR stores `digest → IPFS CID` mapping
-4. **Manifest Upload**: Docker uploads the manifest via `PUT /v2/{name}/manifests/{reference}`
-5. **Manifest Pin**: PinCeR uploads manifest to Filecoin Pin
-6. **Tag Mapping**: PinCeR stores `image:tag → manifest IPFS CID` mapping
-
-When you pull an image:
-
-1. **Tag Lookup**: PinCeR looks up `image:tag` → manifest IPFS CID
-2. **Manifest Fetch**: Retrieves manifest from IPFS gateway
-3. **Layer Resolution**: Maps layer digests → IPFS CIDs from stored mappings
-4. **Layer Streaming**: Streams layers from IPFS gateways
-5. **Standard Response**: Serves content with proper OCI headers
 
 ## License
 
