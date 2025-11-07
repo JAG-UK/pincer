@@ -6,9 +6,9 @@ import { ImageMapping } from './mapping.js';
 import { BlobStorage } from './storage.js';
 import { parseManifestLayers } from './utils.js';
 import { requireAuth, optionalAuth, type AuthCredentials } from './auth.js';
-import { getSynapseService, cleanupAllServices } from './synapse-manager.js';
+import { getSynapseServiceForImage, cleanupAllServices } from './synapse-manager.js';
 import { createCarFromBytes } from './car-utils.js';
-import { executeUpload, getDownloadURL } from 'filecoin-pin/core/upload';
+import { executeUpload } from 'filecoin-pin/core/upload';
 import { CID } from 'multiformats/cid';
 
 const app = express();
@@ -558,8 +558,9 @@ app.put('/v2/*/blobs/uploads/:uploadId', requireAuth, async (req: Request, res: 
   // Get credentials from auth middleware
   const credentials = (req as any).auth as AuthCredentials;
   
-  // Get Synapse service for this user
-  const synapseService = await getSynapseService(credentials, config, logger);
+  // Get Synapse service with a dataset for this specific image
+  // Each image gets its own dataset, keeping manifest + layers together
+  const synapseService = await getSynapseServiceForImage(credentials, config, logger, name);
   
   // Get blob path to read the data
   const blobPath = blobStorage.getBlobPath(actualDigest);
@@ -690,21 +691,20 @@ app.put('/v2/*/manifests/:reference', requireAuth, async (req: Request, res: Res
   
   // Create CAR file from manifest bytes (this is fast, just computing the CID)
   logger.info({ event: 'upload.manifest.start', digest: manifestDigest, size: manifestBytes.length }, 'Creating CAR file from manifest');
-  let carData: Uint8Array;
-  let rootCid: CID;
+  let carData: Uint8Array | null = null;
+  let rootCid: CID | null = null;
   let ipfsCid: string;
   try {
     const result = await createCarFromBytes(manifestBytes, logger);
     carData = result.carData;
     rootCid = result.rootCid;
     ipfsCid = rootCid.toString();
-    logger.info({ event: 'car.created', cid: ipfsCid }, `Created CAR file with CID ${ipfsCid}`);
+    logger.info({ event: 'car.created', cid: ipfsCid, carSize: carData.length }, `Created CAR file with CID ${ipfsCid} (${carData.length} bytes)`);
   } catch (error: any) {
-    logger.error({ event: 'car.create.error', error: error.message }, 'Failed to create CAR file');
-    // Use digest as fallback
+    logger.error({ event: 'car.create.error', error: error.message, stack: error.stack }, 'Failed to create CAR file - will use digest fallback');
+    // Use digest as fallback - manifest won't be uploaded to Filecoin Pin, but can still be served from local storage
     ipfsCid = manifestDigest;
-    carData = new Uint8Array(0); // Empty, won't be used since we're using digest fallback
-    rootCid = CID.parse('bafkqaaa'); // Dummy CID, won't be used
+    // Don't set carData/rootCid - we'll skip the upload if they're null
   }
   
   // Extract layer digests and create blob mappings (do this before upload so we have the mappings)
@@ -765,40 +765,68 @@ app.put('/v2/*/manifests/:reference', requireAuth, async (req: Request, res: Res
   
   // Upload manifest to Filecoin Pin asynchronously in the background
   // This can take a while (needs blockchain confirmations), so we don't block the response
-  logger.info({ event: 'upload.manifest.synapse.start', cid: ipfsCid }, 'Starting async upload to Filecoin Pin');
-  getSynapseService(credentials, config, logger).then((synapseService) => {
-    return executeUpload(synapseService, carData, rootCid, {
-      logger,
-      contextId: `manifest-${manifestDigest}`,
-      metadata: {
-        type: 'oci-manifest',
-        digest: manifestDigest,
-        imageName: name,
-        reference: reference,
-      },
-    });
-  }).then((uploadResult) => {
-    logger.info(
-      { event: 'upload.manifest.synapse.success', cid: ipfsCid, pieceCid: uploadResult.pieceCid },
-      'Manifest uploaded to Filecoin Pin (async)'
-    );
-  }).catch((error: any) => {
-    logger.error({ event: 'upload.manifest.synapse.error', cid: ipfsCid, error: error.message }, 'Failed to upload manifest to Filecoin Pin (async)');
-    
-    // Log specific errors but don't fail the request (already sent response)
-    if (error.message?.includes('InsufficientFunds') || error.message?.includes('Insufficient')) {
-      getSynapseService(credentials, config, logger).then((synapseService) => {
-        return synapseService.synapse.getClient().getAddress();
-      }).then((walletAddress: string) => {
-        logger.error({ event: 'upload.manifest.insufficient_funds', address: walletAddress }, 
-          `❌ Insufficient USDFC (USD Filecoin) funds in wallet ${walletAddress} for async upload. ` +
-          `Fund your wallet at: https://forest-explorer.chainsafe.dev/faucet/calibnet_usdfc`
-        );
-      }).catch(() => {
-        // Ignore errors getting address
+  // Use the same dataset as the image (created when first blob was pushed)
+  // Skip upload if CAR creation failed (carData will be null)
+  if (!carData || !rootCid) {
+    logger.warn({ event: 'upload.manifest.synapse.skipped', cid: ipfsCid, reason: 'CAR creation failed' }, 
+      'Skipping manifest upload to Filecoin Pin - CAR creation failed, using digest fallback');
+    return;
+  }
+  
+  logger.info({ event: 'upload.manifest.synapse.start', cid: ipfsCid, carSize: carData.length }, 'Starting async upload to Filecoin Pin');
+  getSynapseServiceForImage(credentials, config, logger, name)
+    .then((synapseService) => {
+      logger.debug({ event: 'upload.manifest.synapse.service.ready', dataSetId: synapseService.storage.dataSetId }, 
+        `Got Synapse service for image ${name}, dataset ${synapseService.storage.dataSetId}`);
+      return executeUpload(synapseService, carData!, rootCid!, {
+        logger,
+        contextId: `manifest-${manifestDigest}`,
+        metadata: {
+          type: 'oci-manifest',
+          digest: manifestDigest,
+          imageName: name,
+          reference: reference,
+          ipfsRootCID: ipfsCid, // Store root CID in metadata for later retrieval
+        },
       });
-    }
-  });
+    })
+    .then((uploadResult) => {
+      logger.info(
+        { 
+          event: 'upload.manifest.synapse.success', 
+          cid: ipfsCid, 
+          pieceCid: uploadResult.pieceCid,
+          pieceId: uploadResult.pieceId,
+          dataSetId: uploadResult.dataSetId
+        },
+        `Manifest uploaded to Filecoin Pin (async) - Piece CID: ${uploadResult.pieceCid}, Dataset: ${uploadResult.dataSetId}`
+      );
+    })
+    .catch((error: any) => {
+      logger.error({ 
+        event: 'upload.manifest.synapse.error', 
+        cid: ipfsCid, 
+        error: error.message,
+        stack: error.stack,
+        name: name,
+        reference: reference
+      }, `Failed to upload manifest to Filecoin Pin (async): ${error.message}`);
+      
+      // Log specific errors but don't fail the request (already sent response)
+      if (error.message?.includes('InsufficientFunds') || error.message?.includes('Insufficient')) {
+        getSynapseServiceForImage(credentials, config, logger, name)
+          .then((synapseService) => synapseService.synapse.getClient().getAddress())
+          .then((walletAddress: string) => {
+            logger.error({ event: 'upload.manifest.insufficient_funds', address: walletAddress }, 
+              `❌ Insufficient USDFC (USD Filecoin) funds in wallet ${walletAddress} for async upload. ` +
+              `Fund your wallet at: https://forest-explorer.chainsafe.dev/faucet/calibnet_usdfc`
+            );
+          })
+          .catch(() => {
+            // Ignore errors getting address
+          });
+      }
+    });
 });
 
 app.get('/health', (req: Request, res: Response) => {

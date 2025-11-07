@@ -1,14 +1,21 @@
 import pino from 'pino';
-import { setupSynapse, cleanupSynapseService, type SynapseService, type SynapseSetupConfig } from 'filecoin-pin/core';
+import { setupSynapse, cleanupSynapseService, initializeSynapse, createStorageContext, type SynapseService, type SynapseSetupConfig, type CreateStorageContextOptions } from 'filecoin-pin/core';
 import type { Config } from './config.js';
 import type { AuthCredentials } from './auth.js';
 
 /**
- * Per-user Synapse service cache
- * Key: private key (or hash of it for security)
- * Value: SynapseService instance
+ * Per-user base Synapse instance cache (for creating new datasets)
+ * Key: private key
+ * Value: Synapse instance (without storage context)
  */
-const serviceCache = new Map<string, SynapseService>();
+const synapseInstanceCache = new Map<string, any>();
+
+/**
+ * Per-image dataset cache
+ * Key: `${privateKey}:${imageName}`
+ * Value: SynapseService with dataset for that image
+ */
+const imageDatasetCache = new Map<string, SynapseService>();
 
 /**
  * Create a cache key from credentials
@@ -21,82 +28,96 @@ function getCacheKey(credentials: AuthCredentials): string {
 }
 
 /**
- * Get or create Synapse service for a user
+ * Get or create Synapse service for a specific image
  * 
- * This function:
- * 1. Checks if we already have a Synapse service for this user's private key
- * 2. If not, initializes Synapse SDK and storage context
- * 3. Returns the service for use in upload/download operations
+ * This function creates a new dataset for each image, ensuring each image
+ * (manifest + layers) is self-contained in its own dataset.
+ * 
+ * @param credentials - User authentication credentials
+ * @param config - Application configuration
+ * @param logger - Logger instance
+ * @param imageName - Name of the image (e.g., "test/myapp")
+ * @returns SynapseService with a dataset dedicated to this image
+ */
+export async function getSynapseServiceForImage(
+  credentials: AuthCredentials,
+  config: Config,
+  logger: pino.Logger,
+  imageName: string
+): Promise<SynapseService> {
+  const cacheKey = getCacheKey(credentials);
+  const imageCacheKey = `${cacheKey}:${imageName}`;
+  
+  // Check if we already have a dataset for this image
+  const cached = imageDatasetCache.get(imageCacheKey);
+  if (cached) {
+    logger.debug({ event: 'synapse.image_dataset.cache_hit', imageName, dataSetId: cached.storage.dataSetId }, 
+      `Using cached dataset for image: ${imageName}`);
+    return cached;
+  }
+
+  // Create new dataset for this image
+  logger.info({ event: 'synapse.image_dataset.create', imageName }, `Creating new dataset for image: ${imageName}`);
+
+  // Get or create base Synapse instance (without storage context)
+  let synapse = synapseInstanceCache.get(cacheKey);
+  if (!synapse) {
+    const synapseConfig: SynapseSetupConfig = {
+      privateKey: credentials.privateKey,
+      ...(config.rpcUrl && { rpcUrl: config.rpcUrl }),
+      ...(config.warmStorageAddress && { warmStorageAddress: config.warmStorageAddress }),
+    };
+    
+    synapse = await initializeSynapse(synapseConfig, logger);
+    synapseInstanceCache.set(cacheKey, synapse);
+    
+    logger.debug({ event: 'synapse.instance.cached' }, 'Cached base Synapse instance for user');
+  }
+
+  // Create a new dataset for this image
+  const datasetOptions: CreateStorageContextOptions = {
+    dataset: {
+      createNew: true, // Always create a new dataset for each image
+      metadata: {
+        type: 'oci-image',
+        imageName: imageName,
+        source: 'pincer',
+      },
+    },
+  };
+
+  const { storage, providerInfo } = await createStorageContext(synapse, logger, datasetOptions);
+  
+  const service: SynapseService = {
+    synapse,
+    storage,
+    providerInfo,
+  };
+
+  // Cache the service for this image
+  imageDatasetCache.set(imageCacheKey, service);
+
+  logger.info(
+    { event: 'synapse.image_dataset.created', imageName, dataSetId: service.storage.dataSetId },
+    `Created dataset ${service.storage.dataSetId} for image: ${imageName}`
+  );
+
+  return service;
+}
+
+/**
+ * Get or create Synapse service for a user (legacy method, for backward compatibility)
+ * 
+ * @deprecated Use getSynapseServiceForImage instead for per-image datasets
  */
 export async function getSynapseService(
   credentials: AuthCredentials,
   config: Config,
   logger: pino.Logger
 ): Promise<SynapseService> {
-  const cacheKey = getCacheKey(credentials);
-  
-  // Check cache first
-  const cached = serviceCache.get(cacheKey);
-  if (cached) {
-    logger.debug({ event: 'synapse.cache_hit' }, 'Using cached Synapse service');
-    return cached;
-  }
-
-  // Create new service
-  logger.info({ event: 'synapse.service.create' }, 'Creating new Synapse service for user');
-
-  const synapseConfig: SynapseSetupConfig = {
-    privateKey: credentials.privateKey,
-    ...(config.rpcUrl && { rpcUrl: config.rpcUrl }),
-    ...(config.warmStorageAddress && { warmStorageAddress: config.warmStorageAddress }),
-  };
-
-  logger.debug({ event: 'synapse.config', hasRpcUrl: !!config.rpcUrl, hasWarmStorageAddress: !!config.warmStorageAddress }, 'Synapse configuration');
-
-  try {
-    const service = await setupSynapse(synapseConfig, logger);
-    
-    // Log contract addresses for debugging
-    try {
-      const walletAddress = await service.synapse.getClient().getAddress();
-      const warmStorageAddress = service.synapse.getWarmStorageAddress();
-      const network = service.synapse.getNetwork();
-      
-      logger.info({ 
-        event: 'synapse.init.info', 
-        network,
-        walletAddress,
-        warmStorageAddress 
-      }, 
-        `Synapse initialized - Network: ${network}, Wallet: ${walletAddress}, WarmStorage: ${warmStorageAddress}`
-      );
-    } catch (error) {
-      logger.warn({ event: 'synapse.init.info.failed', error }, 'Could not retrieve Synapse info');
-    }
-    
-    // Log wallet address for debugging
-    try {
-      const walletAddress = await service.synapse.getClient().getAddress();
-      logger.info({ event: 'synapse.wallet.address', address: walletAddress }, `Synapse wallet: ${walletAddress}`);
-    } catch (error) {
-      logger.warn({ event: 'synapse.wallet.address.failed', error }, 'Could not retrieve wallet address');
-    }
-
-    // Cache the service
-    serviceCache.set(cacheKey, service);
-
-    logger.info(
-      { event: 'synapse.service.created', dataSetId: service.storage.dataSetId },
-      'Synapse service created and cached'
-    );
-
-    return service;
-  } catch (error: any) {
-    logger.error({ event: 'synapse.service.create.failed', error: error.message, stack: error.stack }, 
-      `Failed to create Synapse service: ${error.message}`
-    );
-    throw error;
-  }
+  // For backward compatibility, use a default image name
+  // This maintains the old behavior of one dataset per user
+  return getSynapseServiceForImage(credentials, config, logger, '__default__');
 }
 
 /**
@@ -104,29 +125,39 @@ export async function getSynapseService(
  * Call this on server shutdown
  */
 export async function cleanupAllServices(): Promise<void> {
-  // Clear cache
-  serviceCache.clear();
+  // Clear caches
+  imageDatasetCache.clear();
+  synapseInstanceCache.clear();
   
   // Clean up active service
   await cleanupSynapseService();
 }
 
 /**
- * Remove a specific service from cache
- * Useful if a user's service needs to be recreated
+ * Remove a specific image's dataset from cache
+ * Useful if an image's dataset needs to be recreated
  */
-export function removeService(credentials: AuthCredentials): void {
+export function removeImageDataset(credentials: AuthCredentials, imageName: string): void {
   const cacheKey = getCacheKey(credentials);
-  serviceCache.delete(cacheKey);
+  const imageCacheKey = `${cacheKey}:${imageName}`;
+  imageDatasetCache.delete(imageCacheKey);
 }
 
 /**
  * Get cache statistics (for debugging/monitoring)
  */
-export function getCacheStats(): { size: number; keys: string[] } {
+export function getCacheStats(): { 
+  imageDatasets: number; 
+  synapseInstances: number;
+  imageKeys: string[];
+} {
   return {
-    size: serviceCache.size,
-    keys: Array.from(serviceCache.keys()).map(key => `${key.slice(0, 10)}...`), // Show first 10 chars only
+    imageDatasets: imageDatasetCache.size,
+    synapseInstances: synapseInstanceCache.size,
+    imageKeys: Array.from(imageDatasetCache.keys()).map(key => {
+      const parts = key.split(':');
+      return parts.length > 1 ? parts[1] : key; // Return image name part
+    }),
   };
 }
 
