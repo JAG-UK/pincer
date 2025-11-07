@@ -1,20 +1,15 @@
-const DEFAULT_IPFS_GATEWAY = 'https://ipfs.io/ipfs/';
-
-function getIpfsUrl(cid: string, gateway: string = DEFAULT_IPFS_GATEWAY): string {
-  // Remove any ipfs:// prefix
-  cid = cid.replace('ipfs://', '').replace('/ipfs/', '').replace(/^\//, '');
-
-  // Handle dweb.link subdomain format
-  if (gateway.includes('dweb.link')) {
-    return `https://${cid}.ipfs.dweb.link`;
+function getIpfsUrl(cid: string, gateway: string = ''): string {
+  // If gateway is provided, use standard path-based format
+  if (gateway) {
+    return `${gateway}/${cid}`;
   }
-
-  // Standard path-based format
-  const base = gateway.replace(/\/$/, '');
-  return `${base}/${cid}`;
+  
+  // Otherwsie use dweb.link subdomain format
+  cid = cid.replace('ipfs://', '').replace('/ipfs/', '').replace(/^\//, '');
+  return `https://${cid}.ipfs.dweb.link`;
 }
 
-export async function fetchFromIpfs(cid: string, gateway: string = DEFAULT_IPFS_GATEWAY): Promise<Buffer> {
+export async function fetchFromIpfs(cid: string, gateway: string = ''): Promise<Buffer> {
   const url = getIpfsUrl(cid, gateway);
   console.debug(`Fetching from IPFS: ${url}`);
 
@@ -27,12 +22,12 @@ export async function fetchFromIpfs(cid: string, gateway: string = DEFAULT_IPFS_
   return Buffer.from(arrayBuffer);
 }
 
-export async function fetchJsonFromIpfs(cid: string, gateway: string = DEFAULT_IPFS_GATEWAY): Promise<any> {
+export async function fetchJsonFromIpfs(cid: string, gateway: string = ''): Promise<any> {
   const content = await fetchFromIpfs(cid, gateway);
   return JSON.parse(content.toString('utf-8'));
 }
 
-export async function* streamFromIpfs(cid: string, gateway: string = DEFAULT_IPFS_GATEWAY): AsyncGenerator<Buffer> {
+export async function* streamFromIpfs(cid: string, gateway: string = ''): AsyncGenerator<Buffer> {
   const url = getIpfsUrl(cid, gateway);
   console.debug(`Streaming from IPFS: ${url}`);
 

@@ -49,6 +49,25 @@ PinCeR can be configured via environment variables:
 - `PINCER_STORAGE_DIR`: Directory for staging blobs during upload (default: `storage`)
 - `PINCER_HOST`: Server host (default: `0.0.0.0`)
 - `PINCER_PORT`: Server port (default: `5002` - changed from 5000 to avoid macOS Control Center conflict)
+- `PINCER_RPC_URL`: Filecoin RPC URL (optional, defaults to calibration testnet)
+- `PINCER_WARM_STORAGE_ADDRESS`: WarmStorage contract address (optional, uses SDK default for network)
+- `PINCER_DATASET_ID`: Explicitly specify which Synapse dataset ID to use (optional, defaults to SDK auto-selection)
+
+### Dataset Selection
+
+**By default, PinCeR creates a new dataset for each image you push.** This ensures each image (manifest + all layers) is self-contained in its own dataset, making it easy to:
+- Organize images independently
+- See what belongs to each image
+- Manage/delete images as units
+
+Each `docker push` will create a new dataset, and all blobs and the manifest for that image will be uploaded to that dataset.
+
+If you prefer clustered behavior (one dataset per user), you can set `PINCER_DATASET_ID` to use a specific dataset for all uploads:
+
+```bash
+# Use dataset ID 127 for all uploads (legacy behavior)
+PINCER_DATASET_ID=127 npm start
+```
 
 ## Usage
 
