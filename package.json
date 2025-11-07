@@ -10,7 +10,8 @@
     "dev": "tsx src/index.ts",
     "test": "vitest",
     "test:coverage": "vitest --coverage",
-    "tools:deposit": "tsx scripts/synapse-deposit.ts"
+    "tools:deposit": "tsx scripts/synapse-deposit.ts",
+    "tools:list": "tsx scripts/list-uploads.ts"
   },
   "keywords": [
     "oci",
