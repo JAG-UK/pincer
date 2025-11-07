@@ -108,12 +108,17 @@ async function main() {
               // Metadata might not be available
             }
 
-            console.log(`\n   Piece #${piece.pieceId}:`);
-            console.log(`     CID: ${piece.pieceCid.toString()}`);
-            console.log(`     IPFS URL: https://ipfs.io/ipfs/${piece.pieceCid.toString()}`);
-            if (Object.keys(metadata).length > 0) {
-              console.log(`     Metadata: ${JSON.stringify(metadata, null, 6)}`);
-            }
+          console.log(`\n   Piece #${piece.pieceId}:`);
+          console.log(`     Piece CID: ${piece.pieceCid.toString()}`);
+          
+          // Use ipfsRootCID from metadata if available, otherwise fall back to piece CID
+          const ipfsCid = (metadata as any)?.ipfsRootCID || piece.pieceCid.toString();
+          console.log(`     IPFS Root CID: ${ipfsCid}`);
+          console.log(`     IPFS URL: https://${ipfsCid}.ipfs.dweb.link`);
+          
+          if (Object.keys(metadata).length > 0) {
+            console.log(`     Metadata: ${JSON.stringify(metadata, null, 6)}`);
+          }
           }
         }
       } catch (error: any) {

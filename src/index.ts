@@ -149,7 +149,7 @@ app.get('/v2/*/manifests/:reference', async (req: Request, res: Response) => {
     
     // For now, use IPFS gateway to fetch
     // TODO: Use Synapse service download URL if we have user credentials
-    const ipfsUrl = `https://ipfs.io/ipfs/${cid}`;
+    const ipfsUrl = `https://${cid}.ipfs.dweb.link`;
     logger.info({ event: 'fetch.manifest.ipfs', cid, url: ipfsUrl }, 'Fetching manifest from IPFS');
     
     const response = await fetch(ipfsUrl, { signal: AbortSignal.timeout(10000) }); // 10 second timeout
@@ -316,7 +316,7 @@ app.get('/v2/*/blobs/:digest', async (req: Request, res: Response) => {
     
     // For now, use IPFS gateway to fetch
     // TODO: Use Synapse service download URL if we have user credentials
-    const ipfsUrl = `https://ipfs.io/ipfs/${cid}`;
+    const ipfsUrl = `https://${cid}.ipfs.dweb.link`;
     logger.info({ event: 'fetch.blob.ipfs.start', cid, url: ipfsUrl }, 'Fetching blob from IPFS');
     
     const response = await fetch(ipfsUrl, { signal: AbortSignal.timeout(10000) }); // 10 second timeout
